@@ -1,0 +1,71 @@
+# --- Versioner --------------------------------------------------------------
+# Startversion för `up`. Tag på Docker Hub (mongo:<version>): "6.0", "7.0", "8.0" eller exakt "6.0.27".
+mongodb_initial_version: "5.0"
+
+# Major-versionerna i den ordning man får uppgradera dem. Man får bara ta ETT steg i taget
+# (6.0 -> 7.0 -> 8.0), MongoDB tillåter inte att hoppa över en major.
+mongo_major_sequence: ["5.0", "6.0", "7.0", "8.0"]
+
+# Sätts vid uppgradering: ansible-playbook upgrade.yml -e target_version=7.0
+# target_major = "7.0" även om target_version är "7.0.14".
+target_major: "{{ (target_version | string).split('.')[:2] | join('.') }}"
+
+# --- Replica set / containrar -----------------------------------------------
+mongo_replica_set_name: rs0
+lab_network: mongo-lab
+
+# Håll ner minnet (WSL har ~4 GB): liten WiredTiger-cache, liten oplog, tak per container.
+mongo_wt_cache_gb: "0.25"
+mongo_oplog_size_mb: 128
+mongo_container_memory: "600m"
+# Tid docker ger mongod att stänga ner rent (SIGTERM) innan SIGKILL.
+mongo_stop_timeout: 60
+
+max_replication_lag_seconds: 10
+
+# --- Kommandon --------------------------------------------------------------
+# Om replica setet kör med auth, lägg till t.ex. "-u admin -p SECRET --authenticationDatabase admin".
+mongo_auth_args: ""
+# Kör mongosh om den finns, annars den gamla mongo-shellen. MongoDB 4.x-imagar har bara `mongo`, 5.0 har båda,
+# 6.0+ har bara `mongosh`. mongo_sh_str = samma sak som text i ett kommando (delas upp av shlex, inga skal inblandade).
+mongo_sh_script: 'if command -v mongosh >/dev/null 2>&1; then exec mongosh "$@"; else exec mongo "$@"; fi'
+mongo_sh_str: "sh -c '{{ mongo_sh_script }}' sh"
+mongo_shell_cmd: "docker exec {{ inventory_hostname }} {{ mongo_sh_str }} --quiet {{ mongo_auth_args }}"
+
+# Skriver ut 'true' om ALLA noder är med, health=1, exakt 1 är PRIMARY och resten SECONDARY.
+mongo_cluster_healthy_cmd: >-
+  {{ mongo_shell_cmd }} --eval
+  "var n={{ groups['mongo_replica'] | length }};var m=rs.status().members;print(m.length==n && m.filter(function(x){return x.health==1 && x.stateStr=='PRIMARY'}).length==1 && m.filter(function(x){return x.health==1 && x.stateStr=='SECONDARY'}).length==n-1)"
+
+# Skriver ut medlemmarnas namn/hälsa/state som JSON.
+mongo_status_summary_cmd: >-
+  {{ mongo_shell_cmd }} --eval
+  "print(JSON.stringify(rs.status().members.map(function(m){return {name:m.name,health:m.health,state:m.stateStr}})))"
+
+# Skriver ut klustrets featureCompatibilityVersion (t.ex. "6.0").
+mongo_get_fcv_cmd: >-
+  {{ mongo_shell_cmd }} --eval
+  "print(db.adminCommand({getParameter:1, featureCompatibilityVersion:1}).featureCompatibilityVersion.version)"
+
+# --- Föredragen primary ---------------------------------------------------------
+# Den här noden får priority 2, övriga 1. MongoDB flyttar då tillbaka primary hit så fort noden är
+# uppe och ikapp efter ett stopp. Ändras med ./lab.sh primary <nod> (eller -e mongo_preferred_primary=...).
+mongo_preferred_primary: mongo-node-1
+mongo_preferred_priority: 2
+
+# --- Testdata (seed.yml / verify.yml) ------------------------------------------
+seed_db: labdb
+seed_collections: [users, products, orders]
+seed_docs_per_collection: 30
+
+# Första containern som faktiskt kör - används av kommandon som ska fungera även när t.ex. mongo-node-1
+# är stoppad. Kräver att en play först satt node_running per nod (se seed.yml/verify.yml/status.yml).
+mongo_entry_node: >-
+  {{ groups['mongo_replica'] | map('extract', hostvars, 'node_running') | zip(groups['mongo_replica'])
+     | selectattr('0') | map(attribute='1') | first }}
+
+# Replica set-anslutning som följer primary automatiskt (körs inifrån en container på docker-nätverket).
+mongo_rs_uri: "mongodb://{{ groups['mongo_replica'] | map('regex_replace', '$', ':27017') | join(',') }}/{{ seed_db }}?replicaSet={{ mongo_replica_set_name }}&serverSelectionTimeoutMS=30000"
+
+# CFG som prefixas före JS-filerna i files/.
+seed_cfg: "{{ {'db': seed_db, 'n': seed_docs_per_collection | int, 'collections': seed_collections, 'reset': (reset | default(false) | bool)} | to_json }}"

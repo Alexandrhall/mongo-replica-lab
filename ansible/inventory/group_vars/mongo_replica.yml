@@ -1,0 +1,78 @@
+# Alla tasks behöver root (apt, docker). ansible_user=ubuntu har NOPASSWD sudo via cloud-init.
+ansible_become: true
+
+# --- Versioner --------------------------------------------------------------
+# MongoDB körs som Docker-container (officiella mongo-imagen).
+# init_replica_set.yml startar med mongodb_initial_version. rolling_upgrade.yml uppgraderar till
+# target_version som anges vid körning: ansible-playbook playbooks/rolling_upgrade.yml -e target_version=6.0
+# Båda måste vara existerande tags på Docker Hub (mongo:<version>), t.ex. "6.0" eller exakt "6.0.27".
+mongodb_initial_version: "5.0"
+
+# Major-versionerna i den ordning man får uppgradera dem. Man får bara ta ETT steg i taget
+# (5.0 -> 6.0 -> 7.0 -> 8.0), MongoDB tillåter inte att hoppa över en major.
+mongo_major_sequence: ["5.0", "6.0", "7.0", "8.0"]
+
+# target_major = "7.0" även om target_version är "7.0.14".
+target_major: "{{ (target_version | string).split('.')[:2] | join('.') }}"
+
+# --- Replica set / container ------------------------------------------------
+mongo_replica_set_name: "rs0"
+mongo_container_name: mongo
+mongo_data_dir: /var/lib/mongo-data
+mongo_port: 27017
+# Tid docker ger mongod att stänga ner rent (SIGTERM) innan SIGKILL.
+mongo_stop_timeout: 60
+
+max_replication_lag_seconds: 10
+
+# --- Kommandon --------------------------------------------------------------
+# Om replica setet kör med auth, lägg till t.ex. "-u admin -p SECRET --authenticationDatabase admin" här.
+mongo_auth_args: ""
+# Kör mongosh om den finns, annars den gamla mongo-shellen. MongoDB 4.x-imagar har bara `mongo`, 5.0 har båda,
+# 6.0+ har bara `mongosh`. mongo_sh_str = samma sak som text i ett kommando (delas upp av shlex, inga skal inblandade).
+mongo_sh_script: 'if command -v mongosh >/dev/null 2>&1; then exec mongosh "$@"; else exec mongo "$@"; fi'
+mongo_sh_str: "sh -c '{{ mongo_sh_script }}' sh"
+# Containern heter alltid "mongo" - vilken NOD kommandot träffar styrs med delegate_to, inte av namnet.
+mongo_shell_cmd: "docker exec {{ mongo_container_name }} {{ mongo_sh_str }} --quiet {{ mongo_auth_args }}"
+
+# Skriver ut 'true' om ALLA inventory-noder är med, health=1, exakt 1 är PRIMARY och resten SECONDARY.
+mongo_cluster_healthy_cmd: >-
+  {{ mongo_shell_cmd }} --eval
+  "var n={{ groups['mongo_replica'] | length }};var m=rs.status().members;print(m.length==n && m.filter(function(x){return x.health==1 && x.stateStr=='PRIMARY'}).length==1 && m.filter(function(x){return x.health==1 && x.stateStr=='SECONDARY'}).length==n-1)"
+
+# Skriver ut medlemmarnas namn/hälsa/state som JSON (för felmeddelanden och rapportering).
+mongo_status_summary_cmd: >-
+  {{ mongo_shell_cmd }} --eval
+  "print(JSON.stringify(rs.status().members.map(function(m){return {name:m.name,health:m.health,state:m.stateStr}})))"
+
+# Skriver ut klustrets featureCompatibilityVersion (t.ex. "7.0").
+mongo_get_fcv_cmd: >-
+  {{ mongo_shell_cmd }} --eval
+  "print(db.adminCommand({getParameter:1, featureCompatibilityVersion:1}).featureCompatibilityVersion.version)"
+
+# --- Föredragen primary -----------------------------------------------------
+# Den här noden får priority 2, övriga 1. MongoDB flyttar då tillbaka primary hit så fort noden är
+# uppe och ikapp ("priority takeover"). Ändras med -e mongo_preferred_primary=mongo-node-2.
+mongo_preferred_primary: mongo-node-1
+mongo_preferred_priority: 2
+# Adressen den föredragna noden annonseras med i replica setet (rs.initiate() använder ansible_host:port).
+mongo_preferred_address: "{{ hostvars[mongo_preferred_primary].ansible_host }}:{{ mongo_port }}"
+
+# Första noden vars mongo-container faktiskt kör - används med delegate_to av kommandon som ska
+# fungera även när t.ex. mongo-node-1 är nere. Kräver att en play först satt node_running per nod
+# (playbooks/tasks/detect_running.yml, se status.yml/seed.yml/verify.yml/primary.yml).
+mongo_entry_node: >-
+  {{ groups['mongo_replica'] | map('extract', hostvars, 'node_running') | zip(groups['mongo_replica'])
+     | selectattr('0') | map(attribute='1') | first }}
+
+# --- Testdata (seed.yml / verify.yml) ---------------------------------------
+seed_db: labdb
+seed_collections: [users, products, orders]
+seed_docs_per_collection: 30
+
+# Replica set-anslutning som följer primary automatiskt. Medlemmarna annonseras som ansible_host:port
+# (se rs.initiate() i init_replica_set.yml), så URI:n byggs av samma adresser.
+mongo_rs_uri: "mongodb://{{ groups['mongo_replica'] | map('extract', hostvars, 'ansible_host') | map('regex_replace', '$', ':' ~ mongo_port) | join(',') }}/{{ seed_db }}?replicaSet={{ mongo_replica_set_name }}&serverSelectionTimeoutMS=30000"
+
+# CFG som prefixas före JS-filerna i playbooks/files/.
+seed_cfg: "{{ {'db': seed_db, 'n': seed_docs_per_collection | int, 'collections': seed_collections, 'reset': (reset | default(false) | bool)} | to_json }}"

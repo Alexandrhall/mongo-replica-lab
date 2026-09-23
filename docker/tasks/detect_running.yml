@@ -1,0 +1,10 @@
+---
+# Sätter node_running (true/false) för noden. Används av seed/verify/status så de klarar att en nod är stoppad.
+- name: "[{{ inventory_hostname }}] Kör containern?"
+  community.docker.docker_container_info:
+    name: "{{ inventory_hostname }}"
+  register: node_info
+
+- name: "[{{ inventory_hostname }}] Spara om containern kör"
+  set_fact:
+    node_running: "{{ node_info.exists and node_info.container.State.Running }}"

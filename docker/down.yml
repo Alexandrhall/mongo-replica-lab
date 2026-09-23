@@ -1,0 +1,32 @@
+---
+# Tar bort containrarna och nätverket. Datat (namngivna volymer) sparas om du inte anger purge=true.
+#
+#   ansible-playbook down.yml                # behåll data (up.yml startar om med samma data)
+#   ansible-playbook down.yml -e purge=true  # ta bort ALLT, inklusive data
+- name: Ta bort containrarna
+  hosts: mongo_replica
+  gather_facts: false
+  tasks:
+    - name: "[{{ inventory_hostname }}] Ta bort containern"
+      community.docker.docker_container:
+        name: "{{ inventory_hostname }}"
+        state: absent
+        stop_timeout: 20
+
+    - name: "[{{ inventory_hostname }}] Ta bort datavolymerna (purge=true)"
+      community.docker.docker_volume:
+        name: "{{ item }}"
+        state: absent
+      loop:
+        - "{{ inventory_hostname }}-data"
+        - "{{ inventory_hostname }}-config"
+      when: purge | default(false) | bool
+
+- name: Ta bort nätverket
+  hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: Ta bort nätverket {{ lab_network }}
+      community.docker.docker_network:
+        name: "{{ lab_network }}"
+        state: absent

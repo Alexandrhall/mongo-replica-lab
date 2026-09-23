@@ -1,0 +1,14 @@
+# Terraform
+terraform/.terraform/
+terraform/*.tfstate
+terraform/*.tfstate.*
+terraform/terraform.tfvars
+terraform/crash.log
+
+# Ansible
+ansible/*.retry
+
+# Dumpar från ./lab.sh dump
+docker/dumps/
+
+.claude

@@ -1,0 +1,47 @@
+---
+# Gör mongo_preferred_primary till föredragen primary (priority 2, övriga 1) och väntar tills den är primary.
+# MongoDB flyttar själv primary dit när noden är uppe och ikapp ("priority takeover").
+# Körs en gång (run_once-play) via mongo_entry_node. prefer_strict=false: varna i stället för att faila.
+- name: "Sätt {{ mongo_preferred_primary }} som föredragen primary (priority {{ mongo_preferred_priority }})"
+  command:
+    argv:
+      - docker
+      - exec
+      - "{{ mongo_entry_node }}"
+      - sh
+      - -c
+      - "{{ mongo_sh_script }}"
+      - sh
+      - --quiet
+      - "{{ mongo_rs_uri }}"
+      - --eval
+      - "var PREFERRED = '{{ mongo_preferred_primary }}'; var PRIORITY = {{ mongo_preferred_priority | int }};\n{{ lookup('file', 'priorities.js') }}"
+  register: prio_out
+  changed_when: prio_out.rc == 0 and ((prio_out.stdout | trim | from_json).changed)
+
+- name: "Vänta tills {{ mongo_preferred_primary }} är primary (kan ta upp till en minut)"
+  command: '{{ mongo_shell_cmd }} --eval "print(db.isMaster().primary)"'
+  register: primary_now
+  until: primary_now.rc == 0 and (primary_now.stdout | trim) == (mongo_preferred_primary ~ ':27017')
+  retries: 30
+  delay: 2
+  changed_when: false
+  failed_when: false
+
+- name: Primary är rätt nod
+  assert:
+    that: primary_now.rc == 0 and (primary_now.stdout | trim) == (mongo_preferred_primary ~ ':27017')
+    fail_msg: >-
+      {{ mongo_preferred_primary }} blev inte primary inom en minut (primary just nu: {{ primary_now.stdout | default('okänd') | trim }}).
+      Kör noden och är den ikapp? Kolla med ./lab.sh status
+    success_msg: "{{ mongo_preferred_primary }} är primary."
+  when: prefer_strict | default(true) | bool
+
+- name: Varning om föredragen primary inte är primary (mjukt läge)
+  debug:
+    msg: >-
+      OBS: {{ mongo_preferred_primary }} är inte primary ännu (primary: {{ primary_now.stdout | default('okänd') | trim }}).
+      Prioriteten är satt, så den tar över så fort den är uppe och ikapp.
+  when:
+    - not (prefer_strict | default(true) | bool)
+    - primary_now.rc != 0 or (primary_now.stdout | trim) != (mongo_preferred_primary ~ ':27017')

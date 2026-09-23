@@ -1,0 +1,63 @@
+---
+# Visar version per nod, replica set-status (vem är PRIMARY), prioriteter och FCV. Ändrar ingenting.
+# Klarar att en eller flera noder (eller hela VM:ar) är nere.
+#
+#   ansible-playbook playbooks/status.yml
+- name: Läs version per nod
+  hosts: mongo_replica
+  gather_facts: false
+  tasks:
+    - ansible.builtin.include_tasks: tasks/detect_running.yml
+
+    - name: "[{{ inventory_hostname }}] Läs db.version()"
+      ansible.builtin.command: '{{ mongo_shell_cmd }} --eval "print(db.version())"'
+      register: ver
+      changed_when: false
+      failed_when: false
+      when: node_running
+
+    - name: "[{{ inventory_hostname }}] Spara version"
+      ansible.builtin.set_fact:
+        node_version: "{{ (ver.stdout | trim) if (node_running and ver.rc | default(1) == 0) else 'NERE' }}"
+
+- name: Sammanfattning
+  hosts: mongo_replica
+  gather_facts: false
+  run_once: true
+  tasks:
+    - name: Minst en nod måste köra
+      ansible.builtin.assert:
+        that: (groups['mongo_replica'] | map('extract', hostvars, 'node_running') | select | list | length) > 0
+        fail_msg: "Inga noder kör. Starta klustret med: ansible-playbook playbooks/init_replica_set.yml"
+
+    # Kommandona delegeras till första nod som kör, så det fungerar även om mongo-node-1 är nere.
+    - name: Läs rs.status()
+      ansible.builtin.command: "{{ mongo_status_summary_cmd }}"
+      delegate_to: "{{ mongo_entry_node }}"
+      register: st
+      changed_when: false
+      failed_when: false
+
+    - name: Läs FCV
+      ansible.builtin.command: "{{ mongo_get_fcv_cmd }}"
+      delegate_to: "{{ mongo_entry_node }}"
+      register: fcv
+      changed_when: false
+      failed_when: false
+
+    - name: Läs prioriteter (högst prioritet = föredragen primary)
+      ansible.builtin.command: >
+        {{ mongo_shell_cmd }} --eval
+        "print(rs.conf().members.map(function(m){return m.host+'='+m.priority}).join('  '))"
+      delegate_to: "{{ mongo_entry_node }}"
+      register: prio
+      changed_when: false
+      failed_when: false
+
+    - name: Visa
+      ansible.builtin.debug:
+        msg:
+          - "Versioner: {{ groups['mongo_replica'] | map('extract', hostvars, 'node_version') | zip(groups['mongo_replica']) | map('reverse') | map('join', '=') | join('  ') }}"
+          - "Prioritet: {{ (prio.stdout | trim) if prio.rc == 0 else 'okänt' }}"
+          - "FCV: {{ (fcv.stdout | trim) if fcv.rc == 0 else 'okänt' }}"
+          - "rs.status() (via {{ mongo_entry_node }}): {{ (st.stdout | trim) if st.rc == 0 else 'replica set inte uppe (ingen primary?)' }}"

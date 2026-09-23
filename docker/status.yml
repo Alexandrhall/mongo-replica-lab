@@ -1,0 +1,60 @@
+---
+# Visar version per nod, replica set-status (vem är PRIMARY) och FCV. Ändrar ingenting.
+# Klarar att en eller flera noder är stoppade.
+- name: Läs version per nod
+  hosts: mongo_replica
+  gather_facts: false
+  tasks:
+    - include_tasks: tasks/detect_running.yml
+
+    - name: Läs db.version()
+      command: '{{ mongo_shell_cmd }} --eval "print(db.version())"'
+      register: ver
+      changed_when: false
+      failed_when: false
+      when: node_running
+
+    - name: Spara version
+      set_fact:
+        node_version: "{{ (ver.stdout | trim) if (node_running and ver.rc == 0) else 'NERE' }}"
+
+- name: Sammanfattning
+  hosts: mongo_replica
+  gather_facts: false
+  run_once: true
+  vars:
+    # Kommandona körs via första nod som kör, så det fungerar även om mongo-node-1 är stoppad.
+    mongo_shell_cmd: "docker exec {{ mongo_entry_node }} {{ mongo_sh_str }} --quiet {{ mongo_auth_args }}"
+  tasks:
+    - name: Minst en nod måste köra
+      assert:
+        that: (groups['mongo_replica'] | map('extract', hostvars) | selectattr('node_running') | list | length) > 0
+        fail_msg: "Inga noder kör. Starta labbet med ./lab.sh up"
+
+    - name: Läs rs.status()
+      command: "{{ mongo_status_summary_cmd }}"
+      register: st
+      changed_when: false
+      failed_when: false
+
+    - name: Läs FCV
+      command: "{{ mongo_get_fcv_cmd }}"
+      register: fcv
+      changed_when: false
+      failed_when: false
+
+    - name: Läs prioriteter (högst prioritet = föredragen primary)
+      command: >
+        {{ mongo_shell_cmd }} --eval
+        "print(rs.conf().members.map(function(m){return m.host+'='+m.priority}).join('  '))"
+      register: prio
+      changed_when: false
+      failed_when: false
+
+    - name: Visa
+      debug:
+        msg:
+          - "Versioner: {{ groups['mongo_replica'] | map('extract', hostvars, 'node_version') | zip(groups['mongo_replica']) | map('reverse') | map('join', '=') | join('  ') }}"
+          - "Prioritet: {{ (prio.stdout | trim) if prio.rc == 0 else 'okänt' }}"
+          - "FCV: {{ (fcv.stdout | trim) if fcv.rc == 0 else 'okänt' }}"
+          - "rs.status() (via {{ mongo_entry_node }}): {{ (st.stdout | trim) if st.rc == 0 else 'replica set inte uppe (ingen primary?)' }}"

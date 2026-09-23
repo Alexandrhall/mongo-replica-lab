@@ -1,0 +1,54 @@
+---
+# Gör mongo_preferred_primary till föredragen primary (priority 2, övriga 1) och väntar tills den är primary.
+# MongoDB flyttar själv primary dit när noden är uppe och ikapp ("priority takeover").
+# Körs en gång (run_once-play) och delegeras till mongo_entry_node, så det fungerar även om nod 1 är nere.
+# prefer_strict=false: varna i stället för att faila.
+#
+# Medlemmarna i replica setet är ansible_host:port (se rs.initiate() i init_replica_set.yml), så
+# priorities.js måste få nodens IP som PREFERRED - inte inventory-namnet som i docker-labbet.
+- name: "Sätt {{ mongo_preferred_primary }} som föredragen primary (priority {{ mongo_preferred_priority }})"
+  ansible.builtin.command:
+    argv:
+      - docker
+      - exec
+      - "{{ mongo_container_name }}"
+      - sh
+      - -c
+      - "{{ mongo_sh_script }}"
+      - sh
+      - --quiet
+      - "{{ mongo_rs_uri }}"
+      - --eval
+      - "var PREFERRED = '{{ hostvars[mongo_preferred_primary].ansible_host }}'; var PRIORITY = {{ mongo_preferred_priority | int }};\n{{ lookup('file', 'priorities.js') }}"
+  delegate_to: "{{ mongo_entry_node }}"
+  register: prio_out
+  changed_when: prio_out.rc == 0 and ((prio_out.stdout | trim | from_json).changed)
+
+- name: "Vänta tills {{ mongo_preferred_primary }} är primary (kan ta upp till en minut)"
+  ansible.builtin.command: '{{ mongo_shell_cmd }} --eval "print(db.isMaster().primary)"'
+  delegate_to: "{{ mongo_entry_node }}"
+  register: primary_now
+  until: primary_now.rc == 0 and (primary_now.stdout | trim) == mongo_preferred_address
+  retries: 30
+  delay: 2
+  changed_when: false
+  failed_when: false
+
+- name: Primary är rätt nod
+  ansible.builtin.assert:
+    that: primary_now.rc == 0 and (primary_now.stdout | trim) == mongo_preferred_address
+    fail_msg: >-
+      {{ mongo_preferred_primary }} ({{ mongo_preferred_address }}) blev inte primary inom en minut
+      (primary just nu: {{ primary_now.stdout | default('okänd') | trim }}).
+      Kör noden och är den ikapp? Kolla med: ansible-playbook playbooks/status.yml
+    success_msg: "{{ mongo_preferred_primary }} ({{ mongo_preferred_address }}) är primary."
+  when: prefer_strict | default(true) | bool
+
+- name: Varning om föredragen primary inte är primary (mjukt läge)
+  ansible.builtin.debug:
+    msg: >-
+      OBS: {{ mongo_preferred_primary }} är inte primary ännu (primary: {{ primary_now.stdout | default('okänd') | trim }}).
+      Prioriteten är satt, så den tar över så fort den är uppe och ikapp.
+  when:
+    - not (prefer_strict | default(true) | bool)
+    - primary_now.rc != 0 or (primary_now.stdout | trim) != mongo_preferred_address

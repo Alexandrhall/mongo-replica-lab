@@ -1,0 +1,27 @@
+---
+# Enda stället där mongo-containern definieras. Används av både init-rollen och upgrade-rollen
+# (via include_role/tasks_from) så att båda alltid skapar containern på samma sätt.
+# Kräver variabeln mongo_image (t.ex. "mongo:8.0.29").
+#
+# host-nätverk: mongod lyssnar direkt på nodens IP, så medlemsadresserna i rs.initiate()
+# (ansible_host:27017) är samma adresser som noderna når varandra på.
+# Ändras image (eller någon annan parameter) återskapar modulen containern; den gamla stoppas
+# med stop_timeout så mongod hinner stänga ner rent.
+- name: "[{{ inventory_hostname }}] Kör mongo-containern ({{ mongo_image }})"
+  community.docker.docker_container:
+    name: "{{ mongo_container_name }}"
+    image: "{{ mongo_image }}"
+    pull: missing
+    state: started
+    restart_policy: unless-stopped
+    network_mode: host
+    stop_timeout: "{{ mongo_stop_timeout }}"
+    command:
+      - "--replSet"
+      - "{{ mongo_replica_set_name }}"
+      - "--bind_ip"
+      - "127.0.0.1,{{ ansible_host }}"
+      - "--port"
+      - "{{ mongo_port }}"
+    volumes:
+      - "{{ mongo_data_dir }}:/data/db"

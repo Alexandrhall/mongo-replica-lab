@@ -1,0 +1,8 @@
+ssh_public_key = "ssh-ed25519 AAAA... din@dator"
+
+# Valfria overrides:
+# node_count      = 3
+# memory_mb       = 2048
+# vcpu            = 2
+# network_cidr    = "192.168.122.0/24"
+# node_ip_start   = 101

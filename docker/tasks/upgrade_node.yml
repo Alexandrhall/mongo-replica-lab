@@ -1,0 +1,54 @@
+---
+# Uppgraderar EN nod (containern med samma namn som inventory_hostname) till mongo:<target_version>.
+# Körs med serial: 1 från upgrade.yml. Kräver att mongo_role och node_version redan är satta.
+- name: "[{{ inventory_hostname }}] Kör redan målversionen?"
+  set_fact:
+    node_at_target: "{{ node_version is match('^' ~ (target_version | string | regex_escape) ~ '([.]|$)') }}"
+
+- name: "[{{ inventory_hostname }}] Hoppar över - kör redan {{ node_version }} (mål: {{ target_version }})"
+  debug:
+    msg: "{{ inventory_hostname }} kör redan {{ node_version }}, ingen uppgradering behövs"
+  when: node_at_target
+
+- name: "[{{ inventory_hostname }}] Uppgradera {{ node_version }} -> {{ target_version }}"
+  when: not node_at_target
+  block:
+    - name: "[{{ inventory_hostname }}] Vänta tills hela klustret är friskt innan denna nod rörs"
+      include_tasks: wait_cluster_healthy.yml
+
+    - name: "[{{ inventory_hostname }}] Stega ner noden om den just nu är primary"
+      command: '{{ mongo_shell_cmd }} --eval "rs.stepDown(120)"'
+      when: mongo_role == 'primary'
+      ignore_errors: true # stepDown stänger connectionen den kördes på, det ger ofta ett ofarligt fel
+
+    - name: "[{{ inventory_hostname }}] Vänta tills noden verkligen inte längre är primary"
+      command: '{{ mongo_shell_cmd }} --eval "print(rs.status().myState)"'
+      register: state_after_stepdown
+      until: state_after_stepdown.rc == 0 and (state_after_stepdown.stdout | trim) != "1"
+      retries: 12
+      delay: 5
+      changed_when: false
+      when: mongo_role == 'primary'
+
+    # Återskapar containern med ny image; den gamla stoppas rent (SIGTERM, mongo_stop_timeout).
+    - name: "[{{ inventory_hostname }}] Byt till mongo:{{ target_version }}"
+      include_tasks: container.yml
+      vars:
+        mongo_image: "mongo:{{ target_version }}"
+
+    - include_tasks: wait_mongod_ready.yml
+
+    - name: "[{{ inventory_hostname }}] Vänta tills noden är fullt tillbaka i replica setet"
+      include_tasks: wait_node_caught_up.yml
+
+    - name: "[{{ inventory_hostname }}] Verifiera att den nya versionen faktiskt körs"
+      command: '{{ mongo_shell_cmd }} --eval "print(db.version())"'
+      register: new_version
+      changed_when: false
+
+    - name: "[{{ inventory_hostname }}] Säkerställ att versionen matchar målet"
+      assert:
+        that:
+          - "(new_version.stdout | trim) is match('^' ~ (target_version | string | regex_escape) ~ '([.]|$)')"
+        fail_msg: "Noden kör {{ new_version.stdout | trim }}, väntade {{ target_version }}"
+        success_msg: "{{ inventory_hostname }} är nu uppgraderad till {{ new_version.stdout | trim }} och helt i synk"

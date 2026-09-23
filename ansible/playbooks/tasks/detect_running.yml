@@ -1,0 +1,30 @@
+---
+# Sätter node_running (true/false) per nod: true = VM:en svarar på SSH OCH mongo-containern kör.
+# Används av status/seed/verify/primary så de klarar att en nod är nere.
+# Skillnad mot docker-labbet: där kan bara containern vara stoppad, här kan hela maskinen vara borta -
+# därför kollas SSH först med ignore_unreachable, annars kastas hosten ut ur playen.
+- name: "[{{ inventory_hostname }}] Svarar VM:en?"
+  ansible.builtin.ping:
+  register: vm_ping
+  ignore_unreachable: true
+  changed_when: false
+
+- name: "[{{ inventory_hostname }}] Kör mongo-containern?"
+  community.docker.docker_container_info:
+    name: "{{ mongo_container_name }}"
+  register: node_info
+  when: vm_ping is not unreachable
+  failed_when: false
+
+# set_fact kräver ingen anslutning, så de här två körs även för en VM som inte svarade.
+- name: "[{{ inventory_hostname }}] Utgå från att noden är nere"
+  ansible.builtin.set_fact:
+    node_reachable: "{{ vm_ping is not unreachable }}"
+    node_running: false
+
+- name: "[{{ inventory_hostname }}] Spara att noden kör"
+  ansible.builtin.set_fact:
+    node_running: "{{ node_info.container.State.Running }}"
+  when:
+    - node_reachable
+    - node_info.exists | default(false)

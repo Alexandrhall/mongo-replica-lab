@@ -1,0 +1,229 @@
+---
+# Rolling upgrade av replica setet till en målversion. Målversionen är OBLIGATORISK:
+#
+#   ansible-playbook upgrade.yml -e target_version=7.0
+#   ansible-playbook upgrade.yml -e target_version=8.0
+#   ansible-playbook upgrade.yml -e target_version=7.0.14      # exakt patch-version
+#   ansible-playbook upgrade.yml -e target_version=8.0 -e set_fcv=false   # låt FCV vara kvar
+#
+# Vad som händer:
+#   1. Validerar att uppgraderingen är tillåten (bara ETT major-steg åt gången, ingen nedgradering,
+#      FCV måste stå på nuvarande major) - innan något ändras.
+#   2. Hämtar imagen, uppgraderar secondaries en och en, sist primary (som stegas ner först).
+#   3. När ALLA noder kör nya binärer sätts featureCompatibilityVersion till nya major
+#      (utan det är uppgraderingen inte "klar" och nästa major-steg nekas).
+# Idempotent: noder som redan kör målversionen hoppas över.
+
+- name: Validera parametrar
+  hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: target_version måste anges (t.ex. 7.0 eller 7.0.14)
+      assert:
+        that:
+          - target_version is defined
+          - (target_version | string) is match('^[0-9]+[.][0-9]+([.][0-9]+)?$')
+        fail_msg: "Ange målversion: -e target_version=7.0  (eller t.ex. 7.0.14)"
+
+    - name: Målets major ska finnas i mongo_major_sequence
+      assert:
+        that: target_major in mongo_major_sequence
+        fail_msg: "Okänd major {{ target_major }}. Tillåtna: {{ mongo_major_sequence | join(', ') }} (utökas i group_vars/all.yml)"
+
+    - name: Kolla att målimagen finns och hämta den innan något rörs
+      community.docker.docker_image:
+        name: mongo
+        tag: "{{ target_version }}"
+        source: pull
+
+- name: Läs varje nods nuvarande version
+  hosts: mongo_replica
+  gather_facts: false
+  tasks:
+    - name: Läs db.version()
+      command: '{{ mongo_shell_cmd }} --eval "print(db.version())"'
+      register: node_version_out
+      changed_when: false
+
+    - name: Spara version och major som fakta
+      set_fact:
+        node_version: "{{ node_version_out.stdout | trim }}"
+        node_major: "{{ (node_version_out.stdout | trim).split('.')[:2] | join('.') }}"
+
+- name: Kontrollera att uppgraderingen är tillåten
+  hosts: mongo_replica
+  gather_facts: false
+  run_once: true
+  vars:
+    idx_map: "{{ dict(mongo_major_sequence | zip(range(mongo_major_sequence | length))) }}"
+    node_majors: "{{ groups['mongo_replica'] | map('extract', hostvars, 'node_major') | list }}"
+    target_idx: "{{ idx_map[target_major] }}"
+  tasks:
+    - name: Alla noders major ska finnas i mongo_major_sequence
+      assert:
+        that: (node_majors | difference(mongo_major_sequence) | length) == 0
+        fail_msg: "Noder kör major utanför {{ mongo_major_sequence }}: {{ node_majors }}"
+
+    - name: Ingen nedgradering
+      vars:
+        highest_idx: "{{ node_majors | map('extract', idx_map) | max }}"
+      assert:
+        that: (target_idx | int) >= (highest_idx | int)
+        fail_msg: >-
+          Nedgradering stöds inte: klustret kör redan {{ mongo_major_sequence[highest_idx | int] }}
+          men målet är {{ target_major }}.
+
+    - name: Bara ett major-steg åt gången
+      vars:
+        lowest_idx: "{{ node_majors | map('extract', idx_map) | min }}"
+      assert:
+        that: (target_idx | int) <= ((lowest_idx | int) + 1)
+        fail_msg: >-
+          Man får inte hoppa över en major: klustret kör {{ mongo_major_sequence[lowest_idx | int] }}
+          och kan uppgraderas till {{ mongo_major_sequence[(lowest_idx | int) + 1] }} (inte direkt till {{ target_major }}).
+          Uppgradera stegvis: {{ mongo_major_sequence | join(' -> ') }}.
+
+    - name: Läs klustrets featureCompatibilityVersion
+      command: "{{ mongo_get_fcv_cmd }}"
+      register: fcv_before
+      changed_when: false
+
+    - name: FCV måste stå på nuvarande major innan nästa major-steg
+      vars:
+        lowest_idx: "{{ node_majors | map('extract', idx_map) | min }}"
+        lowest_major: "{{ mongo_major_sequence[lowest_idx | int] }}"
+      assert:
+        that: >-
+          (target_idx | int) == (lowest_idx | int) or
+          (fcv_before.stdout | trim) == lowest_major
+        fail_msg: >-
+          FCV är {{ fcv_before.stdout | trim }} men måste vara {{ lowest_major }} innan uppgradering till {{ target_major }}.
+          Kör först: ansible-playbook upgrade.yml -e target_version={{ lowest_major }}   (sätter FCV).
+
+- name: Kontrollera att klustret är friskt innan vi börjar
+  hosts: mongo_replica
+  gather_facts: false
+  run_once: true
+  tasks:
+    - name: Kontrollera att alla medlemmar är friska (1 PRIMARY, resten SECONDARY)
+      command: "{{ mongo_cluster_healthy_cmd }}"
+      register: initial_healthy
+      changed_when: false
+      failed_when: false
+
+    - name: Läs rs.status()
+      command: "{{ mongo_status_summary_cmd }}"
+      register: initial_status
+      changed_when: false
+      failed_when: false
+
+    - name: Avbryt om klustret inte är fullt friskt
+      assert:
+        that:
+          - initial_healthy.rc == 0
+          - (initial_healthy.stdout | trim) == 'true'
+        fail_msg: "Klustret är inte fullt friskt, avbryter innan uppgradering påbörjas: {{ initial_status.stdout }}"
+
+- name: Slå fast varje nods roll (primary/secondary)
+  hosts: mongo_replica
+  gather_facts: false
+  tasks:
+    - name: Läs myState lokalt på noden
+      command: '{{ mongo_shell_cmd }} --eval "print(rs.status().myState)"'
+      register: my_state
+      changed_when: false
+
+    - name: Sätt fakta om nodens roll
+      set_fact:
+        mongo_role: "{{ 'primary' if (my_state.stdout | trim) == '1' else 'secondary' }}"
+
+- name: Dela in noderna i uppgraderingsvågor
+  hosts: mongo_replica
+  gather_facts: false
+  run_once: true
+  tasks:
+    - name: Secondaries i våg 1, primary i våg 2
+      add_host:
+        name: "{{ item }}"
+        groups: "{{ 'upgrade_wave_primary' if hostvars[item].mongo_role == 'primary' else 'upgrade_wave_secondaries' }}"
+      loop: "{{ groups['mongo_replica'] }}"
+
+- name: Rolling upgrade - secondaries (en i taget)
+  hosts: upgrade_wave_secondaries
+  serial: 1
+  gather_facts: false
+  tasks:
+    - include_tasks: tasks/upgrade_node.yml
+
+- name: Rolling upgrade - primary (uppgraderas sist)
+  hosts: upgrade_wave_primary
+  serial: 1
+  gather_facts: false
+  tasks:
+    - include_tasks: tasks/upgrade_node.yml
+
+# FCV får först höjas när ALLA noder kör de nya binärerna. setFeatureCompatibilityVersion körs på primary.
+- name: Sätt featureCompatibilityVersion till nya major
+  hosts: mongo_replica
+  gather_facts: false
+  run_once: true
+  vars:
+    set_fcv: true
+    # MongoDB 7.0+ kräver confirm: true på setFeatureCompatibilityVersion.
+    fcv_confirm: "{{ ', confirm: true' if target_major is version('7.0', '>=') else '' }}"
+  tasks:
+    - name: Läs nuvarande FCV
+      command: "{{ mongo_get_fcv_cmd }}"
+      register: fcv_now
+      changed_when: false
+
+    - name: Vem är primary just nu?
+      command: '{{ mongo_shell_cmd }} --eval "print(db.hello().primary)"'
+      register: hello_primary
+      changed_when: false
+
+    - name: Sätt FCV {{ target_major }} (körs på primary)
+      command: >
+        docker exec {{ (hello_primary.stdout | trim).split(':')[0] }} mongosh --quiet {{ mongo_auth_args }} --eval
+        "db.adminCommand({setFeatureCompatibilityVersion: '{{ target_major }}'{{ fcv_confirm }}})"
+      when:
+        - set_fcv | bool
+        - (fcv_now.stdout | trim) != target_major
+
+    - name: Läs FCV efter ändringen
+      command: "{{ mongo_get_fcv_cmd }}"
+      register: fcv_after
+      changed_when: false
+
+    - name: Rapportera FCV
+      debug:
+        msg: >-
+          FCV: {{ fcv_after.stdout | trim }}
+          {{ '' if (set_fcv | bool) else '(set_fcv=false: FCV rördes inte - kör om utan set_fcv=false för att höja den)' }}
+
+- name: Slutverifiering av hela klustret
+  hosts: mongo_replica
+  gather_facts: false
+  run_once: true
+  tasks:
+    - name: Vänta tills alla medlemmar är friska igen
+      command: "{{ mongo_cluster_healthy_cmd }}"
+      register: final_healthy
+      until: final_healthy.rc == 0 and (final_healthy.stdout | trim) == 'true'
+      retries: 12
+      delay: 5
+      changed_when: false
+      failed_when: false
+
+    - name: Läs rs.status() en sista gång
+      command: "{{ mongo_status_summary_cmd }}"
+      register: final_status
+      changed_when: false
+
+    - name: Klustret ska vara helt friskt
+      assert:
+        that:
+          - final_healthy.rc == 0
+          - (final_healthy.stdout | trim) == 'true'
+        fail_msg: "Klustret är INTE friskt efter uppgraderingen: {{ final_status.stdout }}"
+        success_msg: "Rolling upgrade till {{ target_version }} klar, alla noder friska: {{ final_status.stdout }}"

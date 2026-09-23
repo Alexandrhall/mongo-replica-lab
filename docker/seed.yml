@@ -1,0 +1,46 @@
+---
+# Fyller databasen med deterministisk testdata: 3 collections x 30 dokument (+ index).
+# Skrivs mot replica setet (följer primary) med w:majority, så det fungerar även om en nod är nere.
+# Idempotent: kör igen för att återställa/komplettera. Säkert att köra med t.ex. en nod stoppad.
+#
+#   ansible-playbook seed.yml                                  # 30 dokument per collection
+#   ansible-playbook seed.yml -e seed_docs_per_collection=50   # växer till 50 (befintliga rörs inte)
+#   ansible-playbook seed.yml -e reset=true                    # droppa databasen först
+#   ansible-playbook seed.yml -e seed_db=annan_db
+
+- name: Hitta vilka noder som kör
+  hosts: mongo_replica
+  gather_facts: false
+  tasks:
+    - include_tasks: tasks/detect_running.yml
+
+- name: Skriv testdata
+  hosts: mongo_replica
+  gather_facts: false
+  run_once: true
+  tasks:
+    - name: Minst en nod måste köra
+      assert:
+        that: (groups['mongo_replica'] | map('extract', hostvars, 'node_running') | select | list | length) > 0
+        fail_msg: "Inga noder kör. Starta labbet med ./lab.sh up"
+
+    - name: "Skriv {{ seed_collections | length }} collections x {{ seed_docs_per_collection }} dokument till {{ seed_db }} (via {{ mongo_entry_node }})"
+      command:
+        argv:
+          - docker
+          - exec
+          - "{{ mongo_entry_node }}"
+          - sh
+          - -c
+          - "{{ mongo_sh_script }}"
+          - sh
+          - --quiet
+          - "{{ mongo_rs_uri }}"
+          - --eval
+          - "var CFG = {{ seed_cfg }};\n{{ lookup('file', 'testdata.js') }}\n{{ lookup('file', 'seed.js') }}"
+      register: seed_out
+      changed_when: true
+
+    - name: Resultat
+      debug:
+        msg: "{{ seed_out.stdout | trim }}"

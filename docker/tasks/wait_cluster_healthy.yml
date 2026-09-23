@@ -1,0 +1,8 @@
+---
+- name: "[{{ inventory_hostname }}] Vänta tills alla medlemmar är friska (1 PRIMARY, resten SECONDARY)"
+  command: "{{ mongo_cluster_healthy_cmd }}"
+  register: cluster_health
+  until: cluster_health.rc == 0 and (cluster_health.stdout | trim) == 'true'
+  retries: 30
+  delay: 5
+  changed_when: false

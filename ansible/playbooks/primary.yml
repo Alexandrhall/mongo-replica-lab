@@ -1,0 +1,41 @@
+---
+# Flyttar primary till en vald nod genom att göra den till föredragen primary (priority 2, övriga 1).
+# Inställningen ligger kvar i replica setet: faller noden bort och kommer tillbaka tar den över igen.
+# Noden måste köra och vara ikapp. Idempotent.
+#
+#   ansible-playbook playbooks/primary.yml                                    # mongo-node-1 (default)
+#   ansible-playbook playbooks/primary.yml -e mongo_preferred_primary=mongo-node-2
+- name: Hitta vilka noder som kör
+  hosts: mongo_replica
+  gather_facts: false
+  tasks:
+    - ansible.builtin.include_tasks: tasks/detect_running.yml
+
+- name: Flytta primary
+  hosts: mongo_replica
+  gather_facts: false
+  run_once: true
+  tasks:
+    - name: Målnoden ska finnas i inventoryt
+      ansible.builtin.assert:
+        that: mongo_preferred_primary in groups['mongo_replica']
+        fail_msg: "Okänd nod '{{ mongo_preferred_primary }}'. Giltiga: {{ groups['mongo_replica'] | join(', ') }}"
+
+    - name: Målnoden ska köra
+      ansible.builtin.assert:
+        that: hostvars[mongo_preferred_primary].node_running
+        fail_msg: >-
+          {{ mongo_preferred_primary }} är nere. Starta den först:
+          ssh {{ hostvars[mongo_preferred_primary].ansible_user }}@{{ hostvars[mongo_preferred_primary].ansible_host }} sudo docker start {{ mongo_container_name }}
+
+    - ansible.builtin.include_tasks: tasks/prefer_primary.yml
+
+    - name: Läs status
+      ansible.builtin.command: "{{ mongo_status_summary_cmd }}"
+      delegate_to: "{{ mongo_entry_node }}"
+      register: primary_status
+      changed_when: false
+
+    - name: Läge nu
+      ansible.builtin.debug:
+        msg: "{{ primary_status.stdout | trim }}"

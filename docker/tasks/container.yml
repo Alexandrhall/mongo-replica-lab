@@ -1,0 +1,30 @@
+---
+# Enda stället där mongo-containern definieras (används av up.yml och upgrade.yml).
+# Kräver variabeln mongo_image (t.ex. "mongo:7.0").
+# Ändras image återskapar modulen containern; den gamla stoppas med stop_timeout så mongod
+# hinner stänga ner rent. Datat ligger kvar i de namngivna volymerna.
+- name: "[{{ inventory_hostname }}] Kör containern ({{ mongo_image }})"
+  community.docker.docker_container:
+    name: "{{ inventory_hostname }}"
+    hostname: "{{ inventory_hostname }}"
+    image: "{{ mongo_image }}"
+    pull: missing
+    state: started
+    restart_policy: unless-stopped
+    memory: "{{ mongo_container_memory }}"
+    stop_timeout: "{{ mongo_stop_timeout }}"
+    networks:
+      - name: "{{ lab_network }}"
+    published_ports:
+      - "127.0.0.1:{{ host_port }}:27017"
+    command:
+      - "--replSet"
+      - "{{ mongo_replica_set_name }}"
+      - "--bind_ip_all"
+      - "--wiredTigerCacheSizeGB"
+      - "{{ mongo_wt_cache_gb }}"
+      - "--oplogSize"
+      - "{{ mongo_oplog_size_mb }}"
+    volumes:
+      - "{{ inventory_hostname }}-data:/data/db"
+      - "{{ inventory_hostname }}-config:/data/configdb"

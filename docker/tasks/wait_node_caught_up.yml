@@ -1,0 +1,20 @@
+---
+# Väntar tills noden är health=1, är SECONDARY eller PRIMARY (inte RECOVERING/STARTUP2)
+# och har en repliklagg mot primary under tröskelvärdet - dvs helt färdig, inte bara "startad".
+- name: "[{{ inventory_hostname }}] Vänta tills noden är hälsosam OCH ikapp primary"
+  command: >
+    {{ mongo_shell_cmd }} --eval
+    "var s=rs.status();var p=s.members.find(function(m){return m.stateStr=='PRIMARY'});var me=s.members.find(function(m){return m.self==true});var lag=(p&&me&&p.optimeDate&&me.optimeDate)?(p.optimeDate.getTime()-me.optimeDate.getTime())/1000:9999;print(JSON.stringify({state:me.stateStr,health:me.health,lagSeconds:lag}))"
+  register: catch_up_check
+  until: >
+    catch_up_check.rc == 0 and
+    (catch_up_check.stdout | from_json).health == 1 and
+    (catch_up_check.stdout | from_json).state in ['SECONDARY', 'PRIMARY'] and
+    (catch_up_check.stdout | from_json).lagSeconds <= max_replication_lag_seconds
+  retries: 60
+  delay: 5
+  changed_when: false
+
+- name: "[{{ inventory_hostname }}] Rapportera slutlig status för noden"
+  debug:
+    msg: "{{ inventory_hostname }} är {{ (catch_up_check.stdout | from_json).state }}, lag={{ (catch_up_check.stdout | from_json).lagSeconds }}s"

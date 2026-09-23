@@ -1,0 +1,53 @@
+---
+# Uppgraderar EN nod till mongo:<target_version>. Körs med serial: 1 från rolling_upgrade.yml, som också
+# har hämtat imagen på alla noder och satt mongo_role och node_version innan rollen körs.
+
+# Kollas först, så en redan uppgraderad nod inte väntar på klustret i onödan (idempotens).
+# (meta-tasks renderar inte {{ }} i namnet, därför ett statiskt namn här)
+- name: Hoppa över noden om den redan kör målversionen
+  when: node_version is match('^' ~ (target_version | string | regex_escape) ~ '([.]|$)')
+  meta: end_host
+
+- name: "[{{ inventory_hostname }}] Vänta tills hela klustret är friskt innan denna nod rörs"
+  include_tasks: wait_for_cluster_healthy.yml
+
+- name: "[{{ inventory_hostname }}] Stega ner noden om den just nu är primary"
+  command: '{{ mongo_shell_cmd }} --eval "rs.stepDown(120)"'
+  when: mongo_role == 'primary'
+  ignore_errors: true # stepDown stänger connectionen den kördes på, det ger ofta ett ofarligt fel
+
+- name: "[{{ inventory_hostname }}] Vänta tills noden verkligen inte längre är primary"
+  command: '{{ mongo_shell_cmd }} --eval "print(rs.status().myState)"'
+  register: state_after_stepdown
+  until: state_after_stepdown.rc == 0 and (state_after_stepdown.stdout | trim) != "1"
+  retries: 12
+  delay: 5
+  changed_when: false
+  when: mongo_role == 'primary'
+
+# Återskapar containern med ny image; den gamla stoppas med mongo_stop_timeout (rent nedstängd).
+# Datat ligger kvar på värdens mongo_data_dir.
+- name: "[{{ inventory_hostname }}] Byt till mongo:{{ target_version }}"
+  include_role:
+    name: mongo_replica_init
+    tasks_from: container.yml
+  vars:
+    mongo_image: "mongo:{{ target_version }}"
+
+- name: "[{{ inventory_hostname }}] Vänta tills mongod svarar"
+  include_tasks: wait_for_mongod_ready.yml
+
+- name: "[{{ inventory_hostname }}] Vänta tills noden är fullt tillbaka i replica setet"
+  include_tasks: wait_for_node_caught_up.yml
+
+- name: "[{{ inventory_hostname }}] Verifiera att den nya versionen faktiskt körs"
+  command: '{{ mongo_shell_cmd }} --eval "print(db.version())"'
+  register: new_version
+  changed_when: false
+
+- name: "[{{ inventory_hostname }}] Säkerställ att versionen matchar målet"
+  assert:
+    that:
+      - "(new_version.stdout | trim) is match('^' ~ (target_version | string | regex_escape) ~ '([.]|$)')"
+    fail_msg: "Noden kör {{ new_version.stdout | trim }}, väntade {{ target_version }}"
+    success_msg: "{{ inventory_hostname }} är nu uppgraderad till {{ new_version.stdout | trim }} och helt i synk"

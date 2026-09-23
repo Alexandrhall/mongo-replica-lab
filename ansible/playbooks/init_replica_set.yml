@@ -1,0 +1,96 @@
+---
+# Installerar Docker + MongoDB-container på alla noder och initierar replica setet från grunden.
+# Kör den här EN gång innan rolling_upgrade.yml, mot ett helt nytt kluster.
+# Idempotent: kan köras igen utan att skada ett redan initierat set (och nedgraderar inte
+# noder som redan uppgraderats - befintlig container behåller sin image).
+#
+#   ansible-playbook playbooks/init_replica_set.yml
+#   ansible-playbook playbooks/init_replica_set.yml -e mongodb_initial_version=6.0
+
+- name: Installera Docker och starta MongoDB-container på alla noder
+  hosts: mongo_replica
+  become: true
+  roles:
+    - mongo_replica_init
+
+- name: Initiera replica setet (körs en gång, från den första noden i inventoryt)
+  hosts: "{{ groups['mongo_replica'][0] }}"
+  gather_facts: false
+  tasks:
+    - name: Kolla om noden redan är med i ett replica set
+      # Nya mongosh kastar fel (rc 1) på en ej initierad nod, gamla mongo-shellen skriver 0 med rc 0.
+      # Därför kollas utskriften ('1' = initierat), inte bara returkoden.
+      ansible.builtin.command: '{{ mongo_shell_cmd }} --eval "print(rs.status().ok)"'
+      register: rs_status_check
+      changed_when: false
+      failed_when: false
+
+    - name: Sammanfatta om replica setet redan är initierat
+      ansible.builtin.set_fact:
+        rs_initiated: "{{ rs_status_check.rc == 0 and (rs_status_check.stdout | trim) == '1' }}"
+
+    # Medlemsadresserna är ansible_host:port - samma adresser som noderna når varandra på, eftersom
+    # containern kör network_mode: host. mongo_preferred_primary får priority 2, övriga 1, så MongoDB
+    # tar tillbaka primary dit efter ett stopp ("priority takeover").
+    - name: Bygg medlemslistan från Ansible-inventoryt
+      ansible.builtin.set_fact:
+        rs_members: >-
+          [{% for host in groups['mongo_replica'] %}{_id: {{ loop.index0 }}, host: '{{ hostvars[host].ansible_host }}:{{ mongo_port }}', priority: {{ mongo_preferred_priority if host == mongo_preferred_primary else 1 }}}{% if not loop.last %}, {% endif %}{% endfor %}]
+      when: not (rs_initiated | bool)
+
+    - name: Kör rs.initiate() med alla noder i inventoryt
+      ansible.builtin.command: >
+        {{ mongo_shell_cmd }} --eval
+        "var r = rs.initiate({_id: '{{ mongo_replica_set_name }}', members: {{ rs_members }}}); if (!r.ok) { throw new Error(JSON.stringify(r)); } print(JSON.stringify(r))"
+      when: not (rs_initiated | bool)
+
+    - name: Vänta tills en primary faktiskt är vald
+      ansible.builtin.command: >
+        {{ mongo_shell_cmd }} --eval
+        "print(rs.status().members.some(function(m){return m.stateStr=='PRIMARY'}))"
+      register: primary_election
+      until: primary_election.rc == 0 and (primary_election.stdout | trim) == 'true'
+      retries: 30
+      delay: 5
+      changed_when: false
+
+- name: Hitta vilka noder som kör
+  hosts: mongo_replica
+  gather_facts: false
+  tasks:
+    - ansible.builtin.include_tasks: tasks/detect_running.yml
+
+- name: Slutverifiering - hela klustret ska vara friskt
+  hosts: mongo_replica
+  gather_facts: false
+  run_once: true
+  tasks:
+    # För kluster som redan var initierade utan prioriteter: sätt dem nu (no-op om de redan stämmer).
+    # Mjukt läge: varnar bara om den föredragna noden inte hinner bli primary (t.ex. om den är nere).
+    - ansible.builtin.include_tasks: tasks/prefer_primary.yml
+      vars:
+        prefer_strict: false
+
+    - name: Vänta tills alla medlemmar är health=1 (1 PRIMARY, resten SECONDARY)
+      ansible.builtin.command: "{{ mongo_cluster_healthy_cmd }}"
+      delegate_to: "{{ mongo_entry_node }}"
+      register: init_healthy
+      until: init_healthy.rc == 0 and (init_healthy.stdout | trim) == 'true'
+      retries: 12
+      delay: 10
+      changed_when: false
+      failed_when: false
+
+    - name: Läs slutlig rs.status()
+      ansible.builtin.command: "{{ mongo_status_summary_cmd }}"
+      delegate_to: "{{ mongo_entry_node }}"
+      register: init_status
+      changed_when: false
+
+    - name: Klustret ska vara helt friskt
+      ansible.builtin.assert:
+        that:
+          - init_healthy.rc == 0
+          - (init_healthy.stdout | trim) == 'true'
+        fail_msg: "Klustret är INTE friskt efter initiering: {{ init_status.stdout }}"
+        success_msg: "Replica set '{{ mongo_replica_set_name }}' initierat och friskt: {{ init_status.stdout }}"

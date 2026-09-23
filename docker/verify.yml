@@ -1,0 +1,68 @@
+---
+# Kontrollerar att testdatan från seed.yml finns kvar OCH är identisk på varje nod som kör.
+# Läser direkt från varje nod (även secondaries), jämför varje dokument mot det seed genererar och
+# kontrollerar index. Stoppade noder hoppas över (och rapporteras). Ändrar ingenting.
+#
+#   ansible-playbook verify.yml
+#   ansible-playbook verify.yml -e seed_docs_per_collection=50   # om du seedat fler dokument
+
+- name: Kontrollera testdatan på varje nod
+  hosts: mongo_replica
+  gather_facts: false
+  tasks:
+    - include_tasks: tasks/detect_running.yml
+
+    - name: "[{{ inventory_hostname }}] Jämför data mot förväntad testdata (väntar om noden är på väg ikapp)"
+      command:
+        argv:
+          - docker
+          - exec
+          - "{{ inventory_hostname }}"
+          - sh
+          - -c
+          - "{{ mongo_sh_script }}"
+          - sh
+          - --quiet
+          - "mongodb://127.0.0.1:27017/{{ seed_db }}?readPreference=secondaryPreferred"
+          - --eval
+          - "var CFG = {{ seed_cfg }};\n{{ lookup('file', 'testdata.js') }}\n{{ lookup('file', 'verify.js') }}"
+      register: verify_out
+      until: verify_out.rc == 0 and (verify_out.stdout | trim | from_json).ok
+      retries: 20
+      delay: 3
+      changed_when: false
+      failed_when: false
+      when: node_running
+
+    - name: Spara resultatet
+      set_fact:
+        verify_result: "{{ (verify_out.stdout | trim | from_json) if (node_running and verify_out.rc == 0) else {} }}"
+
+- name: Sammanfattning
+  hosts: mongo_replica
+  gather_facts: false
+  run_once: true
+  tasks:
+    - name: Resultat per nod
+      debug:
+        msg: >-
+          {{ item }}:
+          {% if not hostvars[item].node_running %}NERE (hoppades över)
+          {% elif not hostvars[item].verify_result %}KUNDE INTE LÄSA (mongod svarar inte?)
+          {% elif hostvars[item].verify_result.ok %}OK {{ 'PRIMARY' if hostvars[item].verify_result.isPrimary else 'SECONDARY' }} {{ hostvars[item].verify_result.counts }}
+          {% else %}FEL {{ hostvars[item].verify_result.problems }}
+          {% endif %}
+      loop: "{{ groups['mongo_replica'] }}"
+
+    - name: Alla noder som kör ska ha komplett och korrekt data
+      vars:
+        running: "{{ groups['mongo_replica'] | map('extract', hostvars) | selectattr('node_running') | map(attribute='inventory_hostname') | list }}"
+      assert:
+        that:
+          - running | length > 0
+          - groups['mongo_replica'] | map('extract', hostvars) | selectattr('node_running') | map(attribute='verify_result') | selectattr('ok', 'defined') | selectattr('ok') | list | length == running | length
+        fail_msg: >-
+          Testdatan är INTE komplett/korrekt på alla noder som kör - se raderna ovan.
+          Verify förväntade sig {{ seed_docs_per_collection }} dokument per collection. Om du seedat ett annat
+          antal måste du ange det: ./lab.sh verify <antal>  (t.ex. ./lab.sh verify 50)
+        success_msg: "Testdatan ligger kvar och är identisk på alla {{ running | length }} noder som kör."

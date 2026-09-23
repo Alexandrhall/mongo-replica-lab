@@ -1,0 +1,116 @@
+---
+# Startar 3 MongoDB-containrar (mongo-node-1..3) och initierar replica set rs0.
+# Idempotent: kan köras igen. En redan uppgraderad container behåller sin image (ingen nedgradering).
+#
+#   ansible-playbook up.yml                              # startar med mongodb_initial_version (6.0)
+#   ansible-playbook up.yml -e mongodb_initial_version=7.0
+
+- name: Skapa Docker-nätverk och hämta image
+  hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: Skapa nätverket {{ lab_network }} (containrarna når varandra via namn)
+      community.docker.docker_network:
+        name: "{{ lab_network }}"
+        state: present
+
+    - name: Hämta image mongo:{{ mongodb_initial_version }}
+      community.docker.docker_image:
+        name: mongo
+        tag: "{{ mongodb_initial_version }}"
+        source: pull
+
+- name: Starta MongoDB-containrarna
+  hosts: mongo_replica
+  gather_facts: false
+  tasks:
+    - name: "[{{ inventory_hostname }}] Kolla om containern redan finns"
+      community.docker.docker_container_info:
+        name: "{{ inventory_hostname }}"
+      register: mongo_container_info
+
+    - name: "[{{ inventory_hostname }}] Starta containern"
+      include_tasks: tasks/container.yml
+      vars:
+        mongo_image: >-
+          {{ mongo_container_info.container.Config.Image
+             if mongo_container_info.exists
+             else 'mongo:' ~ mongodb_initial_version }}
+
+    - include_tasks: tasks/wait_mongod_ready.yml
+
+    - include_tasks: tasks/detect_running.yml
+
+- name: Initiera replica setet (körs en gång, från den första noden)
+  hosts: "{{ groups['mongo_replica'][0] }}"
+  gather_facts: false
+  tasks:
+    - name: Kolla om noden redan är med i ett replica set
+      # Nya mongosh kastar fel (rc 1) på en ej initierad nod, gamla mongo-shellen (4.0) skriver 0 med rc 0.
+      # Därför kollas utskriften ('1' = initierat), inte bara returkoden.
+      command: '{{ mongo_shell_cmd }} --eval "print(rs.status().ok)"'
+      register: rs_status_check
+      changed_when: false
+      failed_when: false
+
+    - name: Sammanfatta om replica setet redan är initierat
+      set_fact:
+        rs_initiated: "{{ rs_status_check.rc == 0 and (rs_status_check.stdout | trim) == '1' }}"
+
+    - name: Bygg medlemslistan (containernamn, intern port 27017)
+      set_fact:
+        rs_members: >-
+          [{% for host in groups['mongo_replica'] %}{_id: {{ loop.index0 }}, host: '{{ host }}:27017', priority: {{ mongo_preferred_priority if host == mongo_preferred_primary else 1 }}}{% if not loop.last %}, {% endif %}{% endfor %}]
+      when: not (rs_initiated | bool)
+
+    - name: Kör rs.initiate() med alla noder
+      command: >
+        {{ mongo_shell_cmd }} --eval
+        "var r = rs.initiate({_id: '{{ mongo_replica_set_name }}', members: {{ rs_members }}}); if (!r.ok) { throw new Error(JSON.stringify(r)); } print(JSON.stringify(r))"
+      when: not (rs_initiated | bool)
+
+    - name: Vänta tills en primary faktiskt är vald
+      command: >
+        {{ mongo_shell_cmd }} --eval
+        "print(rs.status().members.some(function(m){return m.stateStr=='PRIMARY'}))"
+      register: primary_election
+      until: primary_election.rc == 0 and (primary_election.stdout | trim) == 'true'
+      retries: 30
+      delay: 3
+      changed_when: false
+
+- name: Slutverifiering - hela klustret ska vara friskt
+  hosts: mongo_replica
+  gather_facts: false
+  run_once: true
+  vars:
+    # Körs via första nod som kör (nod 1 kan vara stoppad om up.yml körs mot ett halvt nerplockat labb).
+    mongo_shell_cmd: "docker exec {{ mongo_entry_node }} {{ mongo_sh_str }} --quiet {{ mongo_auth_args }}"
+  tasks:
+    # För kluster som redan var initierade utan prioriteter: sätt dem nu (no-op om de redan stämmer).
+    # Mjukt läge: varnar bara om den föredragna noden inte hinner bli primary (t.ex. om den är stoppad).
+    - include_tasks: tasks/prefer_primary.yml
+      vars:
+        prefer_strict: false
+
+    - name: Vänta tills alla medlemmar är friska (1 PRIMARY, resten SECONDARY)
+      command: "{{ mongo_cluster_healthy_cmd }}"
+      register: init_healthy
+      until: init_healthy.rc == 0 and (init_healthy.stdout | trim) == 'true'
+      retries: 20
+      delay: 3
+      changed_when: false
+      failed_when: false
+
+    - name: Läs slutlig rs.status()
+      command: "{{ mongo_status_summary_cmd }}"
+      register: init_status
+      changed_when: false
+
+    - name: Klustret ska vara helt friskt
+      assert:
+        that:
+          - init_healthy.rc == 0
+          - (init_healthy.stdout | trim) == 'true'
+        fail_msg: "Klustret är INTE friskt: {{ init_status.stdout }}"
+        success_msg: "Replica set '{{ mongo_replica_set_name }}' uppe och friskt: {{ init_status.stdout }}"
