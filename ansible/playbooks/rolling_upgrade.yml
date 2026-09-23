@@ -20,14 +20,14 @@
   run_once: true
   tasks:
     - name: target_version måste anges (t.ex. 8.0 eller 8.0.29)
-      assert:
+      ansible.builtin.assert:
         that:
           - target_version is defined
           - (target_version | string) is match('^[0-9]+[.][0-9]+([.][0-9]+)?$')
         fail_msg: "Ange målversion: -e target_version=8.0  (eller t.ex. 8.0.29)"
 
     - name: Målets major ska finnas i mongo_major_sequence
-      assert:
+      ansible.builtin.assert:
         that: target_major in mongo_major_sequence
         fail_msg: "Okänd major {{ target_major }}. Tillåtna: {{ mongo_major_sequence | join(', ') }} (utökas i inventory/group_vars/mongo_replica.yml)"
 
@@ -36,12 +36,12 @@
   gather_facts: false
   tasks:
     - name: Läs db.version()
-      command: '{{ mongo_shell_cmd }} --eval "print(db.version())"'
+      ansible.builtin.command: '{{ mongo_shell_cmd }} --eval "print(db.version())"'
       register: node_version_out
       changed_when: false
 
     - name: Spara version och major som fakta
-      set_fact:
+      ansible.builtin.set_fact:
         node_version: "{{ node_version_out.stdout | trim }}"
         node_major: "{{ (node_version_out.stdout | trim).split('.')[:2] | join('.') }}"
 
@@ -55,14 +55,14 @@
     target_idx: "{{ idx_map[target_major] }}"
   tasks:
     - name: Alla noders major ska finnas i mongo_major_sequence
-      assert:
+      ansible.builtin.assert:
         that: (node_majors | difference(mongo_major_sequence) | length) == 0
         fail_msg: "Noder kör major utanför {{ mongo_major_sequence }}: {{ node_majors }}"
 
     - name: Ingen nedgradering
       vars:
         highest_idx: "{{ node_majors | map('extract', idx_map) | max }}"
-      assert:
+      ansible.builtin.assert:
         that: (target_idx | int) >= (highest_idx | int)
         fail_msg: >-
           Nedgradering stöds inte: klustret kör redan {{ mongo_major_sequence[highest_idx | int] }}
@@ -71,7 +71,7 @@
     - name: Bara ett major-steg åt gången
       vars:
         lowest_idx: "{{ node_majors | map('extract', idx_map) | min }}"
-      assert:
+      ansible.builtin.assert:
         that: (target_idx | int) <= ((lowest_idx | int) + 1)
         fail_msg: >-
           Man får inte hoppa över en major: klustret kör {{ mongo_major_sequence[lowest_idx | int] }}
@@ -79,7 +79,7 @@
           Uppgradera stegvis: {{ mongo_major_sequence | join(' -> ') }}.
 
     - name: Läs klustrets featureCompatibilityVersion
-      command: "{{ mongo_get_fcv_cmd }}"
+      ansible.builtin.command: "{{ mongo_get_fcv_cmd }}"
       register: fcv_before
       changed_when: false
 
@@ -87,7 +87,7 @@
       vars:
         lowest_idx: "{{ node_majors | map('extract', idx_map) | min }}"
         lowest_major: "{{ mongo_major_sequence[lowest_idx | int] }}"
-      assert:
+      ansible.builtin.assert:
         that: >-
           (target_idx | int) == (lowest_idx | int) or
           (fcv_before.stdout | trim) == lowest_major
@@ -113,19 +113,19 @@
   run_once: true
   tasks:
     - name: Kontrollera att alla medlemmar är friska (1 PRIMARY, resten SECONDARY)
-      command: "{{ mongo_cluster_healthy_cmd }}"
+      ansible.builtin.command: "{{ mongo_cluster_healthy_cmd }}"
       register: initial_healthy
       changed_when: false
       failed_when: false
 
     - name: Läs rs.status()
-      command: "{{ mongo_status_summary_cmd }}"
+      ansible.builtin.command: "{{ mongo_status_summary_cmd }}"
       register: initial_status
       changed_when: false
       failed_when: false
 
     - name: Avbryt om klustret inte är fullt friskt
-      assert:
+      ansible.builtin.assert:
         that:
           - initial_healthy.rc == 0
           - (initial_healthy.stdout | trim) == 'true'
@@ -136,12 +136,12 @@
   gather_facts: false
   tasks:
     - name: Läs myState lokalt på noden
-      command: '{{ mongo_shell_cmd }} --eval "print(rs.status().myState)"'
+      ansible.builtin.command: '{{ mongo_shell_cmd }} --eval "print(rs.status().myState)"'
       register: my_state
       changed_when: false
 
     - name: Sätt fakta om nodens roll
-      set_fact:
+      ansible.builtin.set_fact:
         mongo_role: "{{ 'primary' if (my_state.stdout | trim) == '1' else 'secondary' }}"
 
 - name: Dela in noderna i uppgraderingsvågor
@@ -150,7 +150,7 @@
   run_once: true
   tasks:
     - name: Secondaries i våg 1, primary i våg 2
-      add_host:
+      ansible.builtin.add_host:
         name: "{{ item }}"
         groups: "{{ 'upgrade_wave_primary' if hostvars[item].mongo_role == 'primary' else 'upgrade_wave_secondaries' }}"
       loop: "{{ groups['mongo_replica'] }}"
@@ -169,8 +169,10 @@
   roles:
     - mongo_upgrade_node
 
-# FCV får först höjas när ALLA noder kör de nya binärerna. setFeatureCompatibilityVersion måste köras på primary,
-# så kommandot delegeras till den VM som just nu är primary (efter uppgraderingen är det inte samma nod som förut).
+# FCV får först höjas när ALLA noder kör de nya binärerna. setFeatureCompatibilityVersion måste köras på primary.
+# Primary kan byta nod precis här: när den gamla primaryn kommer tillbaka tar den rollen igen om den har högst
+# prioritet ("priority takeover"). Därför körs kommandot via replica set-URI:n (följer primary) med omförsök,
+# i stället för att slå upp primary en gång och delegera dit.
 - name: Sätt featureCompatibilityVersion till nya major
   hosts: mongo_replica
   gather_facts: false
@@ -181,45 +183,54 @@
     fcv_confirm: "{{ ', confirm: true' if target_major is version('7.0', '>=') else '' }}"
   tasks:
     - name: Läs nuvarande FCV
-      command: "{{ mongo_get_fcv_cmd }}"
+      ansible.builtin.command: "{{ mongo_get_fcv_cmd }}"
       register: fcv_now
       changed_when: false
 
-    - name: Vem är primary just nu?
-      command: '{{ mongo_shell_cmd }} --eval "print(db.hello().primary)"'
-      register: hello_primary
-      changed_when: false
+    # Gamla mongo-shellen kastar inte fel på ok:0, så resultatet kollas i skriptet.
+    - name: Sätt FCV {{ target_major }} (via replica set-URI, hamnar på primary)
+      ansible.builtin.command:
+        argv:
+          - docker
+          - exec
+          - "{{ mongo_container_name }}"
+          - sh
+          - -c
+          - "{{ mongo_sh_script }}"
+          - sh
+          - --quiet
+          - "{{ mongo_rs_uri }}"
+          - --eval
+          - "var r = db.adminCommand({setFeatureCompatibilityVersion: '{{ target_major }}'{{ fcv_confirm }}}); if (!r.ok) { throw new Error(JSON.stringify(r)); } print(JSON.stringify(r))"
+      register: fcv_set
+      until: fcv_set.rc == 0
+      retries: 10
+      delay: 5
       when:
         - set_fcv | bool
         - (fcv_now.stdout | trim) != target_major
 
-    # Medlemmarna i rs.initiate() är ansible_host:port, så primary-adressen kan slås upp mot inventoryt.
-    - name: Slå upp inventory-noden för primary
-      set_fact:
-        primary_host: >-
-          {{ groups['mongo_replica'] | map('extract', hostvars)
-             | selectattr('ansible_host', 'equalto', (hello_primary.stdout | trim).split(':')[0])
-             | map(attribute='inventory_hostname') | first }}
-      when: hello_primary is not skipped
-
-    - name: Sätt FCV {{ target_major }} (körs på primary)
-      command: >
-        {{ mongo_shell_cmd }} --eval
-        "db.adminCommand({setFeatureCompatibilityVersion: '{{ target_major }}'{{ fcv_confirm }}})"
-      # delegate_to templas före when, så den behöver ett värde även när steget hoppas över.
-      delegate_to: "{{ primary_host | default(inventory_hostname) }}"
-      when: hello_primary is not skipped
-
+    # Läses på en nod som kan vara secondary, så vänta tills ändringen replikerats dit.
     - name: Läs FCV efter ändringen
-      command: "{{ mongo_get_fcv_cmd }}"
+      ansible.builtin.command: "{{ mongo_get_fcv_cmd }}"
       register: fcv_after
+      until: not (set_fcv | bool) or (fcv_after.stdout | trim) == target_major
+      retries: 10
+      delay: 3
       changed_when: false
+      failed_when: false
 
-    - name: Rapportera FCV
-      debug:
-        msg: >-
-          FCV: {{ fcv_after.stdout | trim }}
-          {{ '' if (set_fcv | bool) else '(set_fcv=false: FCV rördes inte - kör om utan set_fcv=false för att höja den)' }}
+    - name: FCV ska vara {{ target_major }}
+      ansible.builtin.assert:
+        that: (fcv_after.stdout | trim) == target_major
+        fail_msg: "FCV är {{ fcv_after.stdout | trim }} efter uppgraderingen, väntade {{ target_major }}. Kör om playbooken."
+        success_msg: "FCV: {{ fcv_after.stdout | trim }}"
+      when: set_fcv | bool
+
+    - name: Rapportera FCV (set_fcv=false)
+      ansible.builtin.debug:
+        msg: "FCV: {{ fcv_after.stdout | trim }} (set_fcv=false: FCV rördes inte - kör om utan set_fcv=false för att höja den)"
+      when: not (set_fcv | bool)
 
 - name: Slutverifiering av hela klustret
   hosts: mongo_replica
@@ -227,7 +238,7 @@
   run_once: true
   tasks:
     - name: Vänta tills alla medlemmar är friska igen
-      command: "{{ mongo_cluster_healthy_cmd }}"
+      ansible.builtin.command: "{{ mongo_cluster_healthy_cmd }}"
       register: final_healthy
       until: final_healthy.rc == 0 and (final_healthy.stdout | trim) == 'true'
       retries: 12
@@ -236,12 +247,12 @@
       failed_when: false
 
     - name: Läs rs.status() en sista gång
-      command: "{{ mongo_status_summary_cmd }}"
+      ansible.builtin.command: "{{ mongo_status_summary_cmd }}"
       register: final_status
       changed_when: false
 
     - name: Klustret ska vara helt friskt
-      assert:
+      ansible.builtin.assert:
         that:
           - final_healthy.rc == 0
           - (final_healthy.stdout | trim) == 'true'

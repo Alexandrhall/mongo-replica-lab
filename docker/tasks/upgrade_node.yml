@@ -1,6 +1,6 @@
 ---
 # Uppgraderar EN nod (containern med samma namn som inventory_hostname) till mongo:<target_version>.
-# Körs med serial: 1 från upgrade.yml. Kräver att mongo_role och node_version redan är satta.
+# Körs med serial: 1 från upgrade.yml. Kräver att node_version redan är satt.
 - name: "[{{ inventory_hostname }}] Kör redan målversionen?"
   set_fact:
     node_at_target: "{{ node_version is match('^' ~ (target_version | string | regex_escape) ~ '([.]|$)') }}"
@@ -16,9 +16,16 @@
     - name: "[{{ inventory_hostname }}] Vänta tills hela klustret är friskt innan denna nod rörs"
       include_tasks: wait_cluster_healthy.yml
 
+    # Rollen läses om här i stället för att lita på mongo_role (som bara styr vågindelningen): primary kan ha
+    # flyttat under tidigare noder, t.ex. när en nod med högre prioritet kom tillbaka och tog över.
+    - name: "[{{ inventory_hostname }}] Är noden primary just nu?"
+      command: '{{ mongo_shell_cmd }} --eval "print(rs.status().myState)"'
+      register: state_before_stepdown
+      changed_when: false
+
     - name: "[{{ inventory_hostname }}] Stega ner noden om den just nu är primary"
       command: '{{ mongo_shell_cmd }} --eval "rs.stepDown(120)"'
-      when: mongo_role == 'primary'
+      when: (state_before_stepdown.stdout | trim) == '1'
       ignore_errors: true # stepDown stänger connectionen den kördes på, det ger ofta ett ofarligt fel
 
     - name: "[{{ inventory_hostname }}] Vänta tills noden verkligen inte längre är primary"
@@ -28,7 +35,7 @@
       retries: 12
       delay: 5
       changed_when: false
-      when: mongo_role == 'primary'
+      when: (state_before_stepdown.stdout | trim) == '1'
 
     # Återskapar containern med ny image; den gamla stoppas rent (SIGTERM, mongo_stop_timeout).
     - name: "[{{ inventory_hostname }}] Byt till mongo:{{ target_version }}"

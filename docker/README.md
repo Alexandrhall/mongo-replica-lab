@@ -10,9 +10,10 @@ Kräver bara `docker` och `ansible` (med `community.docker`, som redan finns) �
 
 ```bash
 cd docker
-./lab.sh up                 # 3 x mongo:6.0 + rs.initiate(rs0)
+./lab.sh up                 # 3 x mongo:5.0 + rs.initiate(rs0)
 ./lab.sh status             # version per nod, rs.status(), FCV
 
+./lab.sh upgrade 6.0        # rolling upgrade 5.0 -> 6.0 (+ FCV 6.0)
 ./lab.sh upgrade 7.0        # rolling upgrade 6.0 -> 7.0 (+ FCV 7.0)
 ./lab.sh upgrade 8.0        # rolling upgrade 7.0 -> 8.0 (+ FCV 8.0)
 
@@ -146,7 +147,7 @@ Eller steg för steg:
 eller exakt, t.ex. `7.0.14`. Playbooken:
 
 1. **Validerar innan något ändras:** ingen nedgradering, bara *ett* major-steg åt gången
-   (6.0 → 7.0 → 8.0; `./lab.sh upgrade 8.0` direkt från 6.0 nekas), FCV måste stå på nuvarande major,
+   (5.0 → 6.0 → 7.0 → 8.0; `./lab.sh upgrade 7.0` direkt från 5.0 nekas), FCV måste stå på nuvarande major,
    klustret måste vara friskt, målimagen hämtas.
 2. Uppgraderar **secondaries en och en, sist primary** (stegas ner först). Per nod: vänta på friskt kluster →
    stepDown → byt container till nya imagen → vänta tills noden är `SECONDARY`/`PRIMARY` med lag ≤ 10 s.
@@ -167,7 +168,7 @@ Varje container får `--wiredTigerCacheSizeGB 0.25`, `--oplogSize 128` och ett t
 (`group_vars/all.yml`: `mongo_wt_cache_gb`, `mongo_oplog_size_mb`, `mongo_container_memory`).
 Tre noder bör landa runt 1–1,5 GB totalt (uppskattning, ej uppmätt). Blir en nod OOM-dödad
 (`docker inspect mongo-node-1 --format '{{.State.OOMKilled}}'`) – höj `mongo_container_memory`.
-Diskutrymme: imagerna för 6.0, 7.0 och 8.0 är några hundra MB var.
+Diskutrymme: imagerna för 5.0, 6.0, 7.0 och 8.0 är några hundra MB var.
 
 ## Övrigt
 
@@ -176,4 +177,4 @@ Diskutrymme: imagerna för 6.0, 7.0 och 8.0 är några hundra MB var.
   så anslut från WSL med `mongodb://127.0.0.1:27017/?directConnection=true`.
 - Startversion ändras med `./lab.sh up 7.0` eller `mongodb_initial_version` i `group_vars/all.yml`.
 - Fler major-versioner läggs till i `mongo_major_sequence` (`group_vars/all.yml`).
-- Ingen auth (labb). 6.0 är end-of-life men imagen finns kvar på Docker Hub.
+- Ingen auth (labb). 5.0 och 6.0 är end-of-life men imagerna finns kvar på Docker Hub.

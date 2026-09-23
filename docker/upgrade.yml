@@ -162,7 +162,10 @@
   tasks:
     - include_tasks: tasks/upgrade_node.yml
 
-# FCV får först höjas när ALLA noder kör de nya binärerna. setFeatureCompatibilityVersion körs på primary.
+# FCV får först höjas när ALLA noder kör de nya binärerna. setFeatureCompatibilityVersion måste köras på primary.
+# Primary kan byta nod precis här: när den gamla primaryn kommer tillbaka tar den rollen igen om den har högst
+# prioritet ("priority takeover"). Därför körs kommandot via replica set-URI:n (följer primary) med omförsök,
+# i stället för att slå upp primary en gång och köra där.
 - name: Sätt featureCompatibilityVersion till nya major
   hosts: mongo_replica
   gather_facts: false
@@ -177,29 +180,50 @@
       register: fcv_now
       changed_when: false
 
-    - name: Vem är primary just nu?
-      command: '{{ mongo_shell_cmd }} --eval "print(db.hello().primary)"'
-      register: hello_primary
-      changed_when: false
-
-    - name: Sätt FCV {{ target_major }} (körs på primary)
-      command: >
-        docker exec {{ (hello_primary.stdout | trim).split(':')[0] }} mongosh --quiet {{ mongo_auth_args }} --eval
-        "db.adminCommand({setFeatureCompatibilityVersion: '{{ target_major }}'{{ fcv_confirm }}})"
+    # Gamla mongo-shellen kastar inte fel på ok:0, så resultatet kollas i skriptet.
+    - name: Sätt FCV {{ target_major }} (via replica set-URI, hamnar på primary)
+      command:
+        argv:
+          - docker
+          - exec
+          - "{{ inventory_hostname }}"
+          - sh
+          - -c
+          - "{{ mongo_sh_script }}"
+          - sh
+          - --quiet
+          - "{{ mongo_rs_uri }}"
+          - --eval
+          - "var r = db.adminCommand({setFeatureCompatibilityVersion: '{{ target_major }}'{{ fcv_confirm }}}); if (!r.ok) { throw new Error(JSON.stringify(r)); } print(JSON.stringify(r))"
+      register: fcv_set
+      until: fcv_set.rc == 0
+      retries: 10
+      delay: 3
       when:
         - set_fcv | bool
         - (fcv_now.stdout | trim) != target_major
 
+    # Läses på en nod som kan vara secondary, så vänta tills ändringen replikerats dit.
     - name: Läs FCV efter ändringen
       command: "{{ mongo_get_fcv_cmd }}"
       register: fcv_after
+      until: not (set_fcv | bool) or (fcv_after.stdout | trim) == target_major
+      retries: 10
+      delay: 2
       changed_when: false
+      failed_when: false
 
-    - name: Rapportera FCV
+    - name: FCV ska vara {{ target_major }}
+      assert:
+        that: (fcv_after.stdout | trim) == target_major
+        fail_msg: "FCV är {{ fcv_after.stdout | trim }} efter uppgraderingen, väntade {{ target_major }}. Kör om ./lab.sh upgrade {{ target_version }}"
+        success_msg: "FCV: {{ fcv_after.stdout | trim }}"
+      when: set_fcv | bool
+
+    - name: Rapportera FCV (set_fcv=false)
       debug:
-        msg: >-
-          FCV: {{ fcv_after.stdout | trim }}
-          {{ '' if (set_fcv | bool) else '(set_fcv=false: FCV rördes inte - kör om utan set_fcv=false för att höja den)' }}
+        msg: "FCV: {{ fcv_after.stdout | trim }} (set_fcv=false: FCV rördes inte - kör om utan set_fcv=false för att höja den)"
+      when: not (set_fcv | bool)
 
 - name: Slutverifiering av hela klustret
   hosts: mongo_replica

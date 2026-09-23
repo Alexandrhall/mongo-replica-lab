@@ -1,6 +1,6 @@
 ---
 - name: "[{{ inventory_hostname }}] Kontrollera att alla medlemmar är friska (1 PRIMARY, resten SECONDARY) innan vi fortsätter"
-  command: "{{ mongo_cluster_healthy_cmd }}"
+  ansible.builtin.command: "{{ mongo_cluster_healthy_cmd }}"
   register: cluster_health
   until: cluster_health.rc == 0 and (cluster_health.stdout | trim) == 'true'
   retries: 30

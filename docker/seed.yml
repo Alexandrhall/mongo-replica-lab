@@ -39,7 +39,12 @@
           - --eval
           - "var CFG = {{ seed_cfg }};\n{{ lookup('file', 'testdata.js') }}\n{{ lookup('file', 'seed.js') }}"
       register: seed_out
-      changed_when: true
+      # seed.js skriver {collection: {inserted, updated, total}} - ändrat bara om något faktiskt skrevs.
+      changed_when: >-
+        seed_out.rc == 0 and ((reset | default(false) | bool) or
+        (seed_out.stdout | trim | from_json | dict2items | map(attribute='value')
+         | map('dict2items') | flatten | selectattr('key', 'in', ['inserted', 'updated'])
+         | map(attribute='value') | sum) > 0)
 
     - name: Resultat
       debug:

@@ -1,6 +1,6 @@
 ---
 - name: "[{{ inventory_hostname }}] Vänta tills mongod svarar"
-  command: '{{ mongo_shell_cmd }} --eval "print(db.adminCommand({ping: 1}).ok)"'
+  ansible.builtin.command: '{{ mongo_shell_cmd }} --eval "print(db.adminCommand({ping: 1}).ok)"'
   register: mongod_ping
   until: mongod_ping.rc == 0 and (mongod_ping.stdout | trim) == '1'
   retries: 40

@@ -4,18 +4,18 @@
 # den här rollen gör bara varje nod redo att gå med i ett replica set.
 
 - name: "[{{ inventory_hostname }}] Vänta tills SSH svarar"
-  wait_for_connection:
+  ansible.builtin.wait_for_connection:
     timeout: 300
 
 # cloud-init kör apt (package_update + qemu-guest-agent) vid första boot och håller dpkg-låset.
 - name: "[{{ inventory_hostname }}] Vänta tills cloud-init är klar (annars krockar apt-låset)"
-  command: cloud-init status --wait
+  ansible.builtin.command: cloud-init status --wait
   register: cloud_init_status
   changed_when: false
   failed_when: cloud_init_status.rc not in [0, 2] # 2 = klar men med ofarliga varningar
 
 - name: "[{{ inventory_hostname }}] Installera Docker (docker.io från Ubuntu) och python3-docker för Ansible-modulerna"
-  apt:
+  ansible.builtin.apt:
     name:
       - docker.io
       - python3-docker
@@ -24,16 +24,19 @@
     cache_valid_time: 3600
 
 - name: "[{{ inventory_hostname }}] Se till att docker är igång och startar vid boot"
-  systemd:
+  ansible.builtin.systemd:
     name: docker
     state: started
     enabled: true
 
-- name: "[{{ inventory_hostname }}] Skapa datakatalog för MongoDB"
-  file:
-    path: "{{ mongo_data_dir }}"
+- name: "[{{ inventory_hostname }}] Skapa data- och configkatalog för MongoDB"
+  ansible.builtin.file:
+    path: "{{ item }}"
     state: directory
     mode: "0755"
+  loop:
+    - "{{ mongo_data_dir }}"
+    - "{{ mongo_config_dir }}"
 
 # Kör om rollen mot ett redan uppgraderat kluster ska INTE nedgradera: behåll befintlig image om
 # containern redan finns, använd annars initial-versionen.
@@ -43,7 +46,7 @@
   register: mongo_container_info
 
 - name: "[{{ inventory_hostname }}] Starta mongo-containern"
-  include_tasks: container.yml
+  ansible.builtin.include_tasks: container.yml
   vars:
     mongo_image: >-
       {{ mongo_container_info.container.Config.Image
@@ -54,6 +57,6 @@
 # kan checken "redan med i ett replica set" i init_replica_set.yml misslyckas och köra rs.initiate()
 # på ett redan initierat set. Samma väntan som upgrade-rollen använder.
 - name: "[{{ inventory_hostname }}] Vänta tills mongod svarar"
-  include_role:
+  ansible.builtin.include_role:
     name: mongo_upgrade_node
     tasks_from: wait_for_mongod_ready.yml

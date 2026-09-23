@@ -25,3 +25,4 @@
       - "{{ mongo_port }}"
     volumes:
       - "{{ mongo_data_dir }}:/data/db"
+      - "{{ mongo_config_dir }}:/data/configdb"

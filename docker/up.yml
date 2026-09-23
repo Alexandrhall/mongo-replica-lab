@@ -2,7 +2,7 @@
 # Startar 3 MongoDB-containrar (mongo-node-1..3) och initierar replica set rs0.
 # Idempotent: kan köras igen. En redan uppgraderad container behåller sin image (ingen nedgradering).
 #
-#   ansible-playbook up.yml                              # startar med mongodb_initial_version (6.0)
+#   ansible-playbook up.yml                              # startar med mongodb_initial_version (5.0)
 #   ansible-playbook up.yml -e mongodb_initial_version=7.0
 
 - name: Skapa Docker-nätverk och hämta image

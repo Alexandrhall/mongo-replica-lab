@@ -148,5 +148,5 @@ Playbooken:
 - Docker-labbets `dump`/`restore`/`migrate` (uppgradering via dump/restore, som kan hoppa över majors) och
   `resync-test` finns bara i `docker/`, inte för VM:arna.
 - Att riva klustret på VM-sidan görs med `terraform destroy` (eller `docker rm -f mongo` + `rm -rf
-  /var/lib/mongo-data` på varje nod om du bara vill nollställa MongoDB).
+  /var/lib/mongo-data /var/lib/mongo-config` på varje nod om du bara vill nollställa MongoDB).
 - De statiska IP:erna .101-.103 ligger inom libvirts DHCP-range; kolla att inget annat på nätet fått dem.

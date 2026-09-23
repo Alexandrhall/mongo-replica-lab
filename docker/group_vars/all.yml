@@ -1,9 +1,9 @@
 # --- Versioner --------------------------------------------------------------
-# Startversion för `up`. Tag på Docker Hub (mongo:<version>): "6.0", "7.0", "8.0" eller exakt "6.0.27".
+# Startversion för `up`. Tag på Docker Hub (mongo:<version>): "5.0", "6.0", "7.0", "8.0" eller exakt "6.0.27".
 mongodb_initial_version: "5.0"
 
 # Major-versionerna i den ordning man får uppgradera dem. Man får bara ta ETT steg i taget
-# (6.0 -> 7.0 -> 8.0), MongoDB tillåter inte att hoppa över en major.
+# (5.0 -> 6.0 -> 7.0 -> 8.0), MongoDB tillåter inte att hoppa över en major.
 mongo_major_sequence: ["5.0", "6.0", "7.0", "8.0"]
 
 # Sätts vid uppgradering: ansible-playbook upgrade.yml -e target_version=7.0

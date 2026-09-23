@@ -19,6 +19,9 @@ target_major: "{{ (target_version | string).split('.')[:2] | join('.') }}"
 mongo_replica_set_name: "rs0"
 mongo_container_name: mongo
 mongo_data_dir: /var/lib/mongo-data
+# mongo-imagen deklarerar VOLUME /data/configdb. Monteras den inte skapas en ny anonym volym varje gång
+# containern återskapas (vid varje uppgradering), så den får en egen katalog på värden.
+mongo_config_dir: /var/lib/mongo-config
 mongo_port: 27017
 # Tid docker ger mongod att stänga ner rent (SIGTERM) innan SIGKILL.
 mongo_stop_timeout: 60
